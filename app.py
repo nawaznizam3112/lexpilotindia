@@ -33,6 +33,9 @@ PAGES = ["Overview", "New contract review", "Matter workspace", "Product roadmap
 APPROVED = "Reviewed — approved for delivery"
 REVIEW_OPTIONS = ["Pending", "Review in progress", APPROVED]
 RISK_LEVELS = ["High", "Review", "Informational", "Unassessed"]
+MAX_CHARS = 400_000  # contract text sent to the AI (safety cap; the UI warns if text is cut)
+DRAFT_UNREVIEWED = "AI draft — not reviewed"
+DRAFT_REVIEWED = "Reviewed by advocate"
 
 st.set_page_config(
     page_title="LexPilot | Contract Intelligence",
@@ -179,6 +182,22 @@ def init_db():
             FOREIGN KEY(matter_id) REFERENCES matters(id) ON DELETE CASCADE
         );
         """
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            matter_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            question TEXT,
+            content TEXT NOT NULL,
+            quotes_json TEXT,
+            gaps_json TEXT,
+            truncated INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'AI draft — not reviewed',
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(matter_id) REFERENCES matters(id) ON DELETE CASCADE)"""
         )
         # Safe upgrades for databases created by earlier versions
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(matters)")}
@@ -361,7 +380,7 @@ def gemini_analysis(text):
         from google import genai
 
         client = genai.Client(api_key=api_key)
-        prompt = SYSTEM_PROMPT + "\n\nCONTRACT TEXT:\n" + text[:90000]
+        prompt = SYSTEM_PROMPT + "\n\nCONTRACT TEXT:\n" + text[:MAX_CHARS]
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
@@ -385,6 +404,70 @@ def gemini_analysis(text):
         return {"summary": str(data.get("summary", ""))[:3000], "findings": findings}, None
     except Exception as e:
         return None, f"AI analysis failed: {type(e).__name__}: {e}"
+
+
+# ============================================================ MATTER ASSISTANT
+DRAFT_KINDS = {
+    "Ask a question": "Answer the advocate's question using only the contract text.",
+    "Plain-English summary": "Write a neutral plain-English summary: purpose, parties (if stated), term, payment, key obligations and notable areas that may need advocate attention.",
+    "Negotiation checklist": "Prepare a checklist of points the advocate may wish to raise or verify with the client, each tied to specific contract wording.",
+    "Client cover note (draft)": "Draft a short cover note to the client summarising the preliminary review points. Neutral tone. No legal conclusions or assurances. State that advocate review is pending.",
+    "Email to counterparty (draft)": "Draft a short, polite email to the counterparty asking clarification questions about specific clauses. No admissions, commitments or legal conclusions.",
+}
+
+ASSIST_PROMPT = """You assist a qualified Indian advocate by preparing DRAFT working material from one contract.
+You are not a lawyer. Do not give a final legal opinion, declare enforceability or legality, or say a contract is safe.
+Use ONLY the supplied contract text. Do not invent clauses, parties, dates, figures, law or citations.
+If the text does not answer something, say so in "gaps" instead of guessing.
+Every factual statement about the contract must be supported by a verbatim excerpt in "quotes" (copied exactly, max 40 words each).
+Write "content" in Markdown. Return valid JSON only:
+{"content": "markdown text", "quotes": ["verbatim excerpt", "..."], "gaps": ["what was not found in the text"]}"""
+
+
+def norm(s):
+    s = re.sub(r"\[(?:PAGE|PARAGRAPH|TABLE)[^\]]*\]", " ", s or "")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def verify_quotes(quotes, text):
+    haystack = norm(text)
+    out = []
+    for q in quotes:
+        if isinstance(q, str) and norm(q):
+            out.append({"quote": q.strip()[:600], "found": norm(q) in haystack})
+    return out
+
+
+def gemini_assistant(text, kind, question=""):
+    api_key = get_api_key()
+    if not api_key:
+        return None, "Gemini API key not configured. Add GEMINI_API_KEY to Streamlit secrets or environment."
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+        task = DRAFT_KINDS[kind]
+        if kind == "Ask a question":
+            task += "\n\nQUESTION: " + question.strip()[:2000]
+        prompt = f"{ASSIST_PROMPT}\n\nTASK: {task}\n\nCONTRACT TEXT:\n{text[:MAX_CHARS]}"
+        response = client.models.generate_content(
+            model="gemini-2.5-flash", contents=prompt,
+            config={"response_mime_type": "application/json", "temperature": 0.2},
+        )
+        raw = (response.text or "{}").strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+        data = json.loads(raw)
+        content = str(data.get("content", "")).strip()[:12000]
+        if not content:
+            return None, "The AI returned an empty draft. Try rephrasing or run it again."
+        return {
+            "content": content,
+            "quotes": verify_quotes(list(data.get("quotes", []))[:15], text),
+            "gaps": [str(g)[:500] for g in list(data.get("gaps", []))[:10]],
+            "truncated": len(text) > MAX_CHARS,
+        }, None
+    except Exception as e:
+        return None, f"AI draft failed: {type(e).__name__}: {e}"
 
 
 # ================================================================== STORAGE
@@ -447,6 +530,37 @@ def save_review(mid, lawyer, notes, decision):
 def delete_matter(mid):
     with db() as conn:
         conn.execute("DELETE FROM matters WHERE id=?", (mid,))
+
+
+def save_draft(mid, kind, question, res):
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT INTO drafts(matter_id,kind,question,content,quotes_json,gaps_json,truncated,status,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (mid, kind, question, res["content"], json.dumps(res["quotes"]), json.dumps(res["gaps"]),
+             int(res["truncated"]), DRAFT_UNREVIEWED, now()),
+        )
+        did = cur.lastrowid
+    log_event(mid, "AI draft saved", f"{kind} (draft #{did}) — not reviewed")
+    return did
+
+
+def list_drafts(mid):
+    with db() as conn:
+        return conn.execute("SELECT * FROM drafts WHERE matter_id=? ORDER BY id DESC", (mid,)).fetchall()
+
+
+def review_draft(did, mid, reviewer):
+    with db() as conn:
+        conn.execute("UPDATE drafts SET status=?, reviewed_by=?, reviewed_at=? WHERE id=?",
+                     (DRAFT_REVIEWED, reviewer, now(), did))
+    log_event(mid, "AI draft marked reviewed", f"Draft #{did}; reviewer field: {reviewer}")
+
+
+def delete_draft(did, mid):
+    with db() as conn:
+        conn.execute("DELETE FROM drafts WHERE id=?", (did,))
+    log_event(mid, "AI draft deleted", f"Draft #{did}")
 
 
 # ================================================================== EXPORTS
@@ -530,6 +644,58 @@ def make_docx_pack(m, findings):
     return bio.getvalue()
 
 
+def render_draft_body(content, quotes, gaps, truncated=False):
+    if truncated:
+        st.warning(f"The contract text exceeded {MAX_CHARS:,} characters, so the AI only saw the first part.")
+    st.markdown(content)
+    if quotes:
+        found = sum(1 for q in quotes if q["found"])
+        st.markdown(f"**Source quotes — {found} of {len(quotes)} matched the contract text**")
+        for q in quotes:
+            st.markdown(("✅ " if q["found"] else "⚠️ not matched: ") + f"“{q['quote']}”")
+        if found < len(quotes):
+            st.warning("Some quotes could not be matched to the stored text. Check them against the source before relying on this draft.")
+    if gaps:
+        st.markdown("**Not located in the supplied text**")
+        for g in gaps:
+            st.markdown(f"- {g}")
+
+
+def make_draft_docx(m, d):
+    doc = Document()
+    doc.add_heading(f"{d['kind']} — {m['matter_title']}", 0)
+    reviewed = d["status"] == DRAFT_REVIEWED
+    r = doc.add_paragraph().add_run(
+        f"Reviewer recorded as: {d['reviewed_by']} on {d['reviewed_at']} (self-entered, not authenticated). Not legal advice until the advocate adopts it."
+        if reviewed else
+        "UNREVIEWED AI DRAFT — NOT LEGAL ADVICE — NOT FOR CLIENT DELIVERY"
+    )
+    r.bold = True
+    r.font.color.rgb = RGBColor(36, 117, 75) if reviewed else RGBColor(170, 72, 55)
+    for line in (d["content"] or "").splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("#"):
+            doc.add_heading(line.lstrip("#").strip().replace("**", ""), level=2)
+        elif line.lstrip().startswith(("- ", "* ")):
+            doc.add_paragraph(line.lstrip()[2:].replace("**", ""), style="List Bullet")
+        else:
+            doc.add_paragraph(line.replace("**", ""))
+    quotes = json.loads(d["quotes_json"] or "[]")
+    if quotes:
+        doc.add_heading("Source quotes", level=1)
+        for q in quotes:
+            doc.add_paragraph(("[matched] " if q["found"] else "[NOT MATCHED — verify] ") + q["quote"])
+    gaps = json.loads(d["gaps_json"] or "[]")
+    if gaps:
+        doc.add_heading("Not located in the supplied text", level=1)
+        for g in gaps:
+            doc.add_paragraph(g, style="List Bullet")
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+
 # ============================================================== NAVIGATION
 def go_to(page_name):
     st.session_state["page"] = page_name
@@ -540,7 +706,7 @@ st.sidebar.markdown("### LEXPILOT")
 st.sidebar.caption("CONTRACT INTELLIGENCE · INDIA")
 page = st.sidebar.radio("WORKSPACE", PAGES, key="page")
 st.sidebar.divider()
-st.sidebar.markdown("**MVP 0.3**")
+st.sidebar.markdown("**MVP 0.4**")
 st.sidebar.caption("SQLite · PDF/DOCX · Rules + optional Gemini")
 st.sidebar.caption("Local prototype — no multi-user security")
 st.sidebar.caption("Not legal advice · Advocate review required")
@@ -691,7 +857,7 @@ elif page == "Matter workspace":
         b.metric("Analysis", m["analysis_mode"])
         c.metric("Professional review", m["lawyer_decision"])
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Findings", "Source document", "Advocate review", "Activity"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Findings", "Source document", "Advocate review", "Activity", "Assistant"])
 
         with tab1:
             risk_filter = st.multiselect("Filter by risk level", RISK_LEVELS, default=RISK_LEVELS)
@@ -755,6 +921,79 @@ elif page == "Matter workspace":
                 )
             else:
                 st.caption("No activity events.")
+
+        with tab5:
+            st.warning(
+                "AI drafts are preliminary working material. They can be wrong or incomplete, and nothing here is "
+                "legal advice until a qualified advocate has checked it against the full contract."
+            )
+            has_key = bool(get_api_key())
+            if not has_key:
+                st.info("Add GEMINI_API_KEY to enable drafting. Previously saved drafts stay available below.")
+            if len(m["extracted_text"] or "") > MAX_CHARS:
+                st.warning(f"This contract is longer than {MAX_CHARS:,} characters; the AI will only see the first part.")
+            kind = st.selectbox("What should the assistant prepare?", list(DRAFT_KINDS), key=f"kind_{mid}")
+            question = ""
+            if kind == "Ask a question":
+                question = st.text_area("Your question about this contract", height=90, key=f"q_{mid}",
+                                        placeholder="Example: Who can terminate, and on how much notice?")
+            if st.button("Generate draft", type="primary", disabled=not has_key, key=f"gen_{mid}"):
+                if kind == "Ask a question" and not question.strip():
+                    st.error("Enter a question first.")
+                else:
+                    with st.spinner("Preparing draft from the contract text..."):
+                        res, err = gemini_assistant(m["extracted_text"], kind, question)
+                    if res:
+                        st.session_state[f"preview_{mid}"] = (kind, question, res)
+                    else:
+                        st.error(err)
+
+            pending = st.session_state.get(f"preview_{mid}")
+            if pending:
+                pkind, pquestion, pres = pending
+                st.markdown(f"#### Preview — {pkind}")
+                with st.container(border=True):
+                    render_draft_body(pres["content"], pres["quotes"], pres["gaps"], pres["truncated"])
+                p1, p2 = st.columns(2)
+                if p1.button("Save to matter", type="primary", key=f"savedraft_{mid}", use_container_width=True):
+                    save_draft(mid, pkind, pquestion, pres)
+                    st.session_state.pop(f"preview_{mid}", None)
+                    st.toast("Draft saved to this matter.", icon="✅")
+                    st.rerun()
+                if p2.button("Discard", key=f"discard_{mid}", use_container_width=True):
+                    st.session_state.pop(f"preview_{mid}", None)
+                    st.rerun()
+
+            st.markdown("#### Saved drafts")
+            drafts = list_drafts(mid)
+            if not drafts:
+                st.caption("No drafts saved for this matter yet.")
+            for d in drafts:
+                reviewed = d["status"] == DRAFT_REVIEWED
+                icon = "🟢" if reviewed else "🟠"
+                with st.expander(f"{icon} {d['kind']} · {d['created_at'][:16]} · {d['status']}"):
+                    if d["question"]:
+                        st.caption(f"Question: {d['question']}")
+                    render_draft_body(d["content"], json.loads(d["quotes_json"] or "[]"),
+                                      json.loads(d["gaps_json"] or "[]"), bool(d["truncated"]))
+                    st.divider()
+                    if reviewed:
+                        st.success(f"Marked reviewed by {d['reviewed_by']} on {d['reviewed_at'][:16]}. This is a self-entered record.")
+                    else:
+                        rv = st.text_input("Reviewer name", key=f"rvname_{d['id']}")
+                        ck = st.checkbox("I have checked this draft against the source contract",
+                                         key=f"rvck_{d['id']}")
+                        if st.button("Mark as reviewed", key=f"rvbtn_{d['id']}", disabled=not (rv.strip() and ck)):
+                            review_draft(d["id"], mid, rv.strip())
+                            st.rerun()
+                    x1, x2 = st.columns(2)
+                    x1.download_button("Download draft (.docx)", make_draft_docx(m, d),
+                                       file_name=f"LexPilot_LP-{mid:04d}_draft_{d['id']}.docx",
+                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                       key=f"dl_{d['id']}", use_container_width=True)
+                    if x2.button("Delete draft", key=f"deld_{d['id']}", use_container_width=True):
+                        delete_draft(d["id"], mid)
+                        st.rerun()
 
         st.divider()
         d1, d2 = st.columns(2)
