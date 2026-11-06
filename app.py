@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -372,6 +373,29 @@ def get_api_key():
     return os.getenv("GEMINI_API_KEY", "")
 
 
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]  # tried in order
+TRANSIENT_MARKERS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "504", "DEADLINE")
+
+
+def generate_json(client, prompt, temperature):
+    """Call Gemini in JSON mode; retry busy/transient errors, then fall back to the next model."""
+    last_error = None
+    for model in GEMINI_MODELS:
+        for attempt in range(3):
+            try:
+                return client.models.generate_content(
+                    model=model, contents=prompt,
+                    config={"response_mime_type": "application/json", "temperature": temperature},
+                )
+            except Exception as e:
+                last_error = e
+                if not any(m in str(e) for m in TRANSIENT_MARKERS):
+                    raise
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+    raise last_error
+
+
 def gemini_analysis(text):
     api_key = get_api_key()
     if not api_key:
@@ -381,11 +405,7 @@ def gemini_analysis(text):
 
         client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
         prompt = SYSTEM_PROMPT + "\n\nCONTRACT TEXT:\n" + text[:MAX_CHARS]
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config={"response_mime_type": "application/json", "temperature": 0.1},
-        )
+        response = generate_json(client, prompt, 0.1)
         raw = (response.text or "{}").strip()
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
         data = json.loads(raw)
@@ -450,10 +470,7 @@ def gemini_assistant(text, kind, question=""):
         if kind == "Ask a question":
             task += "\n\nQUESTION: " + question.strip()[:2000]
         prompt = f"{ASSIST_PROMPT}\n\nTASK: {task}\n\nCONTRACT TEXT:\n{text[:MAX_CHARS]}"
-        response = client.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt,
-            config={"response_mime_type": "application/json", "temperature": 0.2},
-        )
+        response = generate_json(client, prompt, 0.2)
         raw = (response.text or "{}").strip()
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
         data = json.loads(raw)
