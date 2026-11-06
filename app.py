@@ -379,7 +379,7 @@ def gemini_analysis(text):
     try:
         from google import genai
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
         prompt = SYSTEM_PROMPT + "\n\nCONTRACT TEXT:\n" + text[:MAX_CHARS]
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -445,7 +445,7 @@ def gemini_assistant(text, kind, question=""):
     try:
         from google import genai
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
         task = DRAFT_KINDS[kind]
         if kind == "Ask a question":
             task += "\n\nQUESTION: " + question.strip()[:2000]
